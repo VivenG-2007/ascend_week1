@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: campusvoice-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir backend"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7
+      - key: COLLEGE_NAME
+        value: "Geethanjali College of Engineering and Technology"
+      - key: DATABASE_URL
+        value: "sqlite:///./campusvoice.db"
+      - key: FRONTEND_ORIGIN
+        value: "https://campusvoice-frontend.vercel.app"
+      - key: CHROMA_PERSIST_DIRECTORY
+        value: "./chroma_db"
+      - key: CHROMA_COLLECTION_NAME
+        value: "campusvoice_chunks"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_MINUTES
+        value: "1440"
+      - key: SIMILARITY_THRESHOLD
+        value: "0.55"
