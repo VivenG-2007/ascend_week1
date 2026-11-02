@@ -1,127 +1,164 @@
+"""OCR via Azure AI Document Intelligence (Form Recognizer prebuilt-read model).
+
+Falls back to NullOcr when OCR_PROVIDER=none or Azure credentials are missing.
 """
-Document Extraction & OCR Service
-Supports native PDF extraction, Azure AI Document Intelligence, and GPT-4.1 Vision fallback.
-"""
-import io
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any, Tuple, Optional
-from app.config import settings
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Protocol
 
-logger = logging.getLogger("campusvoice.ocr")
+from app.config import get_settings
 
-def extract_text_from_pdf_stream(file_bytes: bytes) -> List[Dict[str, Any]]:
+log = logging.getLogger("campusvoice.ocr")
+
+
+class OcrUnavailable(RuntimeError):
+    pass
+
+
+@dataclass
+class OcrResult:
+    text: str
+    confidence: float | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+class OcrProvider(Protocol):
+    name: str
+
+    def ocr_image(self, png_bytes: bytes) -> OcrResult: ...
+
+
+class NullOcr:
+    name = "none"
+
+    def ocr_image(self, png_bytes: bytes) -> OcrResult:
+        raise OcrUnavailable("OCR is disabled (OCR_PROVIDER=none).")
+
+
+class AzureDocumentIntelligenceOcr:
+    """OCR via Azure AI Document Intelligence (prebuilt-read model).
+
+    Requires:
+      AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = https://<resource>.cognitiveservices.azure.com/
+      AZURE_DOCUMENT_INTELLIGENCE_KEY      = <32-byte key>
+
+    Install: pip install azure-ai-documentintelligence
     """
-    Extracts text page-by-page from PDF bytes.
-    Returns a list of dicts: {"page_number": int, "text": str, "ocr_applied": bool, "warnings": str}
-    """
-    pages_data = []
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(file_bytes))
-        
-        for idx, page in enumerate(reader.pages):
-            page_num = idx + 1
-            extracted = page.extract_text() or ""
-            extracted = extracted.strip()
 
-            ocr_applied = False
-            warning = None
+    name = "azure-document-intelligence"
+    MAX_IMAGE_BYTES = 4 * 1024 * 1024  # Azure Document Intelligence Free tier limit is 4MB
 
-            # If extractable text is very sparse (< 40 characters), attempt OCR
-            if len(extracted) < 40:
-                logger.info(f"[OCR] Page {page_num} has sparse text ({len(extracted)} chars). Triggering OCR fallback...")
-                ocr_text, warning = perform_cloud_ocr_or_vision(file_bytes, is_pdf=True, page_num=page_num)
-                if ocr_text:
-                    extracted = ocr_text
-                    ocr_applied = True
-
-            pages_data.append({
-                "page_number": page_num,
-                "text": extracted,
-                "ocr_applied": ocr_applied,
-                "warnings": warning
-            })
-    except Exception as e:
-        logger.error(f"[EXTRACTION ERROR] Failed to parse PDF: {e}")
-        pages_data.append({
-            "page_number": 1,
-            "text": "",
-            "ocr_applied": False,
-            "warnings": f"Extraction failure: {str(e)}"
-        })
-
-    return pages_data
-
-def extract_text_from_image_stream(file_bytes: bytes, mime_type: str = "image/png") -> Dict[str, Any]:
-    """
-    Extracts text from image bytes using Azure Document Intelligence or GPT-4.1 Vision.
-    """
-    ocr_text, warning = perform_cloud_ocr_or_vision(file_bytes, is_pdf=False, mime_type=mime_type)
-    return {
-        "page_number": 1,
-        "text": ocr_text or "",
-        "ocr_applied": True,
-        "warnings": warning
-    }
-
-def perform_cloud_ocr_or_vision(
-    file_bytes: bytes, 
-    is_pdf: bool = False, 
-    page_num: int = 1,
-    mime_type: str = "application/pdf"
-) -> Tuple[str, Optional[str]]:
-    """
-    Attempts Azure AI Document Intelligence first; if not configured, uses GPT-4.1 Vision;
-    otherwise logs warning for admin review.
-    """
-    # 1. Try Azure AI Document Intelligence
-    if settings.AZURE_DOC_INTEL_ENDPOINT and settings.AZURE_DOC_INTEL_KEY:
+    def __init__(self, endpoint: str, key: str) -> None:
+        log.info("Initialising Azure Document Intelligence OCR endpoint=%s", endpoint)
         try:
             from azure.ai.documentintelligence import DocumentIntelligenceClient
             from azure.core.credentials import AzureKeyCredential
+        except ImportError as exc:
+            raise OcrUnavailable(
+                "azure-ai-documentintelligence is not installed. "
+                "Run: pip install azure-ai-documentintelligence"
+            ) from exc
+        self._client = DocumentIntelligenceClient(endpoint, AzureKeyCredential(key))
+        log.info("Azure Document Intelligence OCR ready")
+
+    @classmethod
+    def _optimize_image(cls, data: bytes) -> bytes:
+        """Compress or downscale images exceeding Azure Document Intelligence's payload limit using PyMuPDF."""
+        if len(data) <= cls.MAX_IMAGE_BYTES:
+            return data
+
+        import pymupdf as fitz
+
+        log.info(
+            "Image size (%d bytes) exceeds Azure OCR limit (%d bytes); compressing...",
+            len(data),
+            cls.MAX_IMAGE_BYTES,
+        )
+        try:
+            pix = fitz.Pixmap(data)
+            if pix.alpha:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            for quality in (85, 70, 55, 40):
+                compressed = pix.tobytes("jpeg", jpg_quality=quality)
+                if len(compressed) <= cls.MAX_IMAGE_BYTES:
+                    log.info(
+                        "Compressed image: %d -> %d bytes (quality=%d)",
+                        len(data),
+                        len(compressed),
+                        quality,
+                    )
+                    return compressed
+            return compressed
+        except Exception:
+            log.exception("Image compression failed; falling back to original data")
+            return data
+
+    def ocr_image(self, png_bytes: bytes) -> OcrResult:
+        payload = self._optimize_image(png_bytes)
+        log.debug("Azure Document Intelligence: sending %d bytes for OCR", len(payload))
+        try:
             from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 
-            client = DocumentIntelligenceClient(
-                endpoint=settings.AZURE_DOC_INTEL_ENDPOINT,
-                credential=AzureKeyCredential(settings.AZURE_DOC_INTEL_KEY)
-            )
-            poller = client.begin_analyze_document(
-                "prebuilt-layout",
-                AnalyzeDocumentRequest(bytes_source=file_bytes)
+            poller = self._client.begin_analyze_document(
+                "prebuilt-read",
+                AnalyzeDocumentRequest(bytes_source=payload),
             )
             result = poller.result()
-            lines = [line.content for page in result.pages for line in page.lines]
-            return "\n".join(lines), None
-        except Exception as e:
-            logger.warning(f"[OCR] Azure Document Intelligence failed: {e}")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Azure Document Intelligence OCR failed")
+            raise OcrUnavailable(f"Azure Document Intelligence failed: {exc}") from exc
 
-    # 2. Try GPT-4.1 Vision via Azure AI Foundry / OpenAI
-    if settings.AZURE_AI_FOUNDRY_ENDPOINT and settings.AZURE_AI_FOUNDRY_API_KEY:
+        lines: list[str] = []
+        confidences: list[float] = []
+        for page in result.pages or []:
+            for line in page.lines or []:
+                lines.append(line.content)
+            for word in page.words or []:
+                if word.confidence is not None:
+                    confidences.append(float(word.confidence))
+
+        text = "\n".join(lines)
+        avg_conf = (sum(confidences) / len(confidences)) if confidences else None
+        warnings: list[str] = []
+
+        if not text.strip():
+            warnings.append("Azure Document Intelligence found no readable text.")
+        elif avg_conf is not None and avg_conf < 0.55:
+            warnings.append(
+                f"Low OCR confidence ({avg_conf:.0%}); text may contain errors."
+            )
+
+        log.debug(
+            "Azure OCR complete: %d chars across %d lines, avg_confidence=%.3f",
+            len(text),
+            len(lines),
+            avg_conf or 0.0,
+        )
+        return OcrResult(text=text, confidence=avg_conf, warnings=warnings)
+
+
+@lru_cache
+def get_ocr() -> OcrProvider:
+    s = get_settings()
+    if s.ocr_provider == "none":
+        log.info("OCR disabled (OCR_PROVIDER=none)")
+        return NullOcr()
+    if s.ocr_provider == "azure":
+        if not s.azure_ocr_configured:
+            log.warning(
+                "OCR_PROVIDER=azure but AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT/KEY not set — OCR disabled"
+            )
+            return NullOcr()
         try:
-            import base64
-            from openai import AzureOpenAI
-            b64_image = base64.b64encode(file_bytes).decode("utf-8")
-            
-            client = AzureOpenAI(
-                azure_endpoint=settings.AZURE_AI_FOUNDRY_ENDPOINT,
-                api_key=settings.AZURE_AI_FOUNDRY_API_KEY,
-                api_version=settings.AZURE_AI_FOUNDRY_API_VERSION
+            return AzureDocumentIntelligenceOcr(
+                s.azure_document_intelligence_endpoint,  # type: ignore[arg-type]
+                s.azure_document_intelligence_key,       # type: ignore[arg-type]
             )
-            response = client.chat.completions.create(
-                model=settings.MODEL_VISION,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Extract all text, notices, dates, tables, and official circular content from this document image accurately. Do not summarize; transcribe the exact text verbatim in English and Telugu."},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}}
-                        ]
-                    }
-                ],
-                max_tokens=2000
-            )
-            return response.choices[0].message.content, None
-        except Exception as e:
-            logger.warning(f"[OCR] Vision model OCR failed: {e}")
-
-    return "", "Cloud OCR credentials (AZURE_DOC_INTEL or AZURE_AI_FOUNDRY) not configured. Uploaded scan requires OCR provider."
+        except OcrUnavailable as exc:
+            log.warning("Azure OCR unavailable: %s — OCR disabled", exc)
+            return NullOcr()
+    log.warning("Unknown OCR_PROVIDER=%r — OCR disabled", s.ocr_provider)
+    return NullOcr()

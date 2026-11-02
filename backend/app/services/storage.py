@@ -1,49 +1,116 @@
-"""
-Document Storage Service (Supabase Storage Cloud or Local Filesystem)
-"""
-import os
-import uuid
+"""Original-file storage: Supabase Storage (cloud) with local-directory fallback for dev."""
+from __future__ import annotations
+
 import logging
+import re
+from functools import lru_cache
 from pathlib import Path
-from typing import Tuple
-from app.config import settings, PROJECT_ROOT
+from typing import Protocol
+from urllib.parse import quote
 
-logger = logging.getLogger("campusvoice.storage")
+import httpx
 
-UPLOADS_DIR = Path(PROJECT_ROOT) / "uploads"
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+from app.config import BACKEND_DIR, get_settings
 
-def save_document_file(file_bytes: bytes, original_filename: str, content_type: str) -> Tuple[str, str]:
-    """
-    Saves the file to Supabase Storage if configured, or local uploads directory.
-    Returns (file_url, storage_path).
-    """
-    ext = Path(original_filename).suffix.lower() or ".bin"
-    unique_filename = f"{uuid.uuid4()}{ext}"
+log = logging.getLogger("campusvoice.storage")
+_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
-    # 1. Supabase Storage (Cloud)
-    if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
-        try:
-            from supabase import create_client
-            supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
-            bucket = settings.SUPABASE_STORAGE_BUCKET
-            
-            # Upload to bucket
-            res = supabase.storage.from_(bucket).upload(
-                path=unique_filename,
-                file=file_bytes,
-                file_options={"content-type": content_type}
-            )
-            public_url = supabase.storage.from_(bucket).get_public_url(unique_filename)
-            logger.info(f"[SUPABASE STORAGE] Successfully uploaded {unique_filename} to bucket '{bucket}'.")
-            return public_url, unique_filename
-        except Exception as e:
-            logger.warning(f"[SUPABASE STORAGE] Cloud upload failed: {e}. Falling back to local storage.")
 
-    # 2. Local Filesystem Fallback
-    local_path = UPLOADS_DIR / unique_filename
-    with open(local_path, "wb") as f:
-        f.write(file_bytes)
+def safe_filename(name: str) -> str:
+    """Strip directories and unsafe characters (prevents path traversal)."""
+    base = re.split(r"[\\/]", name or "")[-1]
+    base = _SAFE.sub("_", base).strip("._") or "upload"
+    return base[:100]
 
-    logger.info(f"[LOCAL STORAGE] Saved document to {local_path}")
-    return f"/uploads/{unique_filename}", str(local_path)
+
+class Storage(Protocol):
+    def save(self, path: str, data: bytes, content_type: str) -> str: ...
+    def read(self, path: str) -> bytes: ...
+    def public_url(self, path: str) -> str | None: ...
+
+
+class LocalStorage:
+    def __init__(self, root: str) -> None:
+        p = Path(root)
+        self.root = (p if p.is_absolute() else BACKEND_DIR / p).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        log.info("LocalStorage: root=%s", self.root)
+
+    def _resolve(self, path: str) -> Path:
+        target = (self.root / path).resolve()
+        if self.root not in target.parents:
+            raise ValueError("Invalid storage path")
+        return target
+
+    def save(self, path: str, data: bytes, content_type: str) -> str:
+        target = self._resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        log.debug("LocalStorage.save: %s (%d bytes)", path, len(data))
+        return path
+
+    def read(self, path: str) -> bytes:
+        log.debug("LocalStorage.read: %s", path)
+        return self._resolve(path).read_bytes()
+
+    def public_url(self, path: str) -> str | None:
+        return None
+
+
+class SupabaseStorage:
+    def __init__(self, url: str, key: str, bucket: str, client: httpx.Client | None = None) -> None:
+        self.base = url.rstrip("/") + "/storage/v1"
+        self.bucket = bucket
+        self.http = client or httpx.Client(timeout=30)
+        self.headers = {"Authorization": f"Bearer {key}", "apikey": key}
+        log.info("SupabaseStorage: url=%s bucket=%s", url, bucket)
+
+    def save(self, path: str, data: bytes, content_type: str) -> str:
+        log.debug("SupabaseStorage.save: path=%s size=%d bytes", path, len(data))
+        r = self.http.post(
+            f"{self.base}/object/{self.bucket}/{quote(path)}",
+            content=data,
+            headers={**self.headers, "Content-Type": content_type, "x-upsert": "true"},
+        )
+        if r.status_code >= 300:
+            log.error("Supabase Storage upload failed HTTP %d path=%s", r.status_code, path)
+            raise RuntimeError(f"Supabase Storage upload failed (HTTP {r.status_code})")
+        log.debug("SupabaseStorage.save: OK path=%s", path)
+        return path
+
+    def read(self, path: str) -> bytes:
+        log.debug("SupabaseStorage.read: path=%s", path)
+        r = self.http.get(
+            f"{self.base}/object/{self.bucket}/{quote(path)}", headers=self.headers
+        )
+        if r.status_code >= 300:
+            log.error("Supabase Storage download failed HTTP %d path=%s", r.status_code, path)
+            raise RuntimeError(f"Supabase Storage download failed (HTTP {r.status_code})")
+        log.debug("SupabaseStorage.read: %d bytes for path=%s", len(r.content), path)
+        return r.content
+
+    def public_url(self, path: str) -> str | None:
+        r = self.http.post(
+            f"{self.base}/object/sign/{self.bucket}/{quote(path)}",
+            json={"expiresIn": 300},
+            headers=self.headers,
+        )
+        if r.status_code >= 300:
+            log.warning("SupabaseStorage.public_url: failed HTTP %d path=%s", r.status_code, path)
+            return None
+        signed = r.json().get("signedURL") or r.json().get("signedUrl")
+        if not signed:
+            return None
+        url = self.base + signed if signed.startswith("/") else signed
+        log.debug("SupabaseStorage.public_url: signed URL for path=%s", path)
+        return url
+
+
+@lru_cache
+def get_storage() -> Storage:
+    s = get_settings()
+    if s.supabase_url and s.supabase_service_role_key:
+        log.info("Using Supabase cloud storage")
+        return SupabaseStorage(s.supabase_url, s.supabase_service_role_key, s.supabase_storage_bucket)
+    log.info("Using local file storage (Supabase not configured)")
+    return LocalStorage(s.local_storage_directory)

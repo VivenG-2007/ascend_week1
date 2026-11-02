@@ -1,199 +1,62 @@
-"""
-Public Voice Endpoint for Push-To-Talk Voice AI
-"""
-import time
-import uuid
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
+import logging
+from time import perf_counter
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
+
+from app.config import Settings, get_settings
 from app.db.session import get_db
-from app.db.models import Message
-from app.schemas.chat import ChatResponse, SourceCitation, TicketInfo
-from app.services.stt import transcribe_audio_bytes
-from app.services.tts import synthesize_speech
-from app.services.llm_agent import execute_agent_turn
-from app.config import settings
+from app.deps import get_agent, get_stt_service, get_tts_service
+from app.schemas.chat import ChatResponse
+from app.services.audio import SILENCE_RMS, AudioError, validate_audio
+from app.services.chat_service import handle_turn
+from app.services.llm_agent import Agent
+from app.services.ratelimit import chat_limit
+from app.services.stt import SpeechError, SpeechToText
+from app.services.tts import TextToSpeech
+import re
 
-from app.services.auth import get_optional_current_user
+router = APIRouter(prefix="/api", tags=["voice"])
+log = logging.getLogger("campusvoice.voice")
+_SESSION = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
-router = APIRouter(prefix="/api", tags=["Voice"])
 
-@router.post("/voice", response_model=ChatResponse)
-async def voice_endpoint(
-    audio: UploadFile = File(...),
-    language: Optional[str] = Form("en"),
-    session_id: Optional[str] = Form(None),
-    voice_name: Optional[str] = Form(None),
-    user_name: Optional[str] = Form(None),
-    user_email: Optional[str] = Form(None),
-    user_phone: Optional[str] = Form(None),
+@router.post("/voice", response_model=ChatResponse, dependencies=[Depends(chat_limit)])
+def voice(
+    audio: Annotated[UploadFile, File(description="16 kHz mono WAV, at most MAX_AUDIO_SECONDS long")],
+    language: Annotated[str, Form()] = "auto",
+    session_id: Annotated[str | None, Form()] = None,
+    speak: Annotated[bool, Form()] = True,
     db: Session = Depends(get_db),
-    auth_user: Optional[dict] = Depends(get_optional_current_user)
-):
-    start_time = time.perf_counter()
+    agent: Agent = Depends(get_agent),
+    settings: Settings = Depends(get_settings),
+    tts: TextToSpeech | None = Depends(get_tts_service),
+    stt: SpeechToText = Depends(get_stt_service),
+) -> ChatResponse:
+    started = perf_counter()
+    if language not in ("auto", "en", "te"):
+        raise HTTPException(422, "language must be auto, en or te")
+    if session_id is not None and not _SESSION.match(session_id):
+        raise HTTPException(422, "Invalid session_id")
 
-    audio_bytes = await audio.read()
-    if not audio_bytes or len(audio_bytes) < 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Received empty or unreadable audio."
-        )
-
-    # Resolve user details
-    user_info = auth_user or {}
-    if user_name and not user_info.get("full_name"):
-        user_info["full_name"] = user_name
-    if user_email and not user_info.get("email"):
-        user_info["email"] = user_email
-    if user_phone and not user_info.get("phone"):
-        user_info["phone"] = user_phone
-
-    # 1. Speech-to-Text (Azure AI Speech)
+    raw = audio.file.read(4 * 1024 * 1024 + 1)
     try:
-        transcript, detected_lang, stt_ms = transcribe_audio_bytes(audio_bytes, language or "en")
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Speech recognition failed: {str(e)}"
-        )
+        info = validate_audio(raw, settings.max_audio_seconds)
+    except AudioError as exc:
+        raise HTTPException(exc.status_code, exc.message)
+    if info.rms < SILENCE_RMS:
+        raise HTTPException(422, "I could not hear anything. Check your microphone and try again, or type your question.")
 
-    # 2. Agent Reasoning & Grounded RAG Turn
-    agent_result = execute_agent_turn(
-        message=transcript,
-        language=detected_lang,
-        db=db,
-        use_mini=False,
-        user_info=user_info if user_info else None
-    )
+    t0 = perf_counter()
+    try:
+        result = stt.transcribe(info.wav, language)
+    except SpeechError as exc:
+        raise HTTPException(503 if exc.unavailable else 422 if exc.empty else 502, exc.message)
+    stt_ms = round((perf_counter() - t0) * 1000)
+    if not result.text.strip():
+        raise HTTPException(422, "I could not hear any speech. Please try again or type your question.")
 
-    # 3. Text-to-Speech (Azure AI Speech Neural Voice)
-    audio_b64, tts_ms = synthesize_speech(
-        agent_result["answer_text"],
-        detected_lang,
-        voice_name=voice_name
-    )
-
-    total_latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
-    s_id = session_id or str(uuid.uuid4())
-
-    source_citations = [
-        SourceCitation(
-            title=s["title"],
-            department=s.get("department"),
-            source_date=s.get("source_date"),
-            page_number=s.get("page_number"),
-            document_id=s.get("document_id"),
-            replaces=s.get("replaces"),
-            superseded=s.get("superseded", False)
-        )
-        for s in agent_result.get("sources", [])
-    ]
-
-    ticket_obj = None
-    if agent_result.get("ticket"):
-        t_data = agent_result["ticket"]
-        ticket_obj = TicketInfo(
-            id=t_data["id"],
-            question=t_data["question"],
-            department=t_data["department"],
-            status=t_data["status"],
-            summary=t_data.get("summary"),
-            created_at=t_data.get("created_at"),
-            user_name=t_data.get("user_name"),
-            user_email=t_data.get("user_email"),
-            user_phone=t_data.get("user_phone")
-        )
-
-    # Persist in DB
-    user_msg = Message(
-        session_id=s_id,
-        role="user",
-        text=transcript,
-        language=detected_lang,
-        stt_ms=stt_ms,
-        latency_ms=0.0
-    )
-    bot_msg = Message(
-        session_id=s_id,
-        role="assistant",
-        text=agent_result["answer_text"],
-        language=detected_lang,
-        sources=[s.model_dump() for s in source_citations],
-        confidence=agent_result.get("confidence", 1.0),
-        stt_ms=stt_ms,
-        llm_ms=agent_result["llm_ms"],
-        tts_ms=tts_ms,
-        latency_ms=total_latency_ms,
-        ticket_id=ticket_obj.id if ticket_obj else None
-    )
-    db.add(user_msg)
-    db.add(bot_msg)
-    db.commit()
-
-    return ChatResponse(
-        transcript=transcript,
-        language=detected_lang,
-        answer_text=agent_result["answer_text"],
-        audio_base64=audio_b64,
-        audio_url=None,
-        sources=source_citations,
-        ticket=ticket_obj,
-        confidence=agent_result.get("confidence"),
-        latency_ms=total_latency_ms,
-        stt_ms=stt_ms,
-        llm_ms=agent_result["llm_ms"],
-        tts_ms=tts_ms
-    )
-
-
-class TeluguVoiceComparisonRequest(BaseModel):
-    text: Optional[str] = "గీతాంజలి ఇంజనీరింగ్ కళాశాలలో సెమిస్టర్ ఫీజు చెల్లించడానికి చివరి తేదీ ఎప్పుడు?"
-
-
-@router.get("/voice/telugu-voices")
-def get_telugu_voices():
-    """Returns official Azure AI Speech Telugu Neural voice options and documentation."""
-    from app.services.tts import TELUGU_NEURAL_VOICES
-    return {
-        "status": "success",
-        "supported_voices": TELUGU_NEURAL_VOICES,
-        "configured_default": settings.AZURE_SPEECH_TTS_VOICE_TE,
-        "microsoft_learn_reference": "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=tts#text-to-speech"
-    }
-
-
-@router.post("/voice/compare-telugu-voices")
-def compare_telugu_voices(payload: Optional[TeluguVoiceComparisonRequest] = None):
-    """
-    Synthesizes real Telugu text with both te-IN-ShrutiNeural and te-IN-MohanNeural
-    allowing direct side-by-side listening and latency comparison.
-    """
-    from app.services.tts import TELUGU_NEURAL_VOICES
-    query_text = (
-        payload.text.strip()
-        if payload and payload.text
-        else "గీతాంజలి ఇంజనీరింగ్ కళాశాలలో సెమిస్టర్ ఫీజు చెల్లించడానికి చివరి తేదీ ఎప్పుడు?"
-    )
-
-    results = {}
-    for voice_id, meta in TELUGU_NEURAL_VOICES.items():
-        audio_b64, latency_ms = synthesize_speech(query_text, language="te", voice_name=voice_id)
-        results[voice_id] = {
-            "voice_name": voice_id,
-            "gender": meta["gender"],
-            "style": meta["style"],
-            "latency_ms": latency_ms,
-            "audio_base64_available": audio_b64 is not None,
-            "audio_base64": audio_b64
-        }
-
-    return {
-        "query_text": query_text,
-        "language": "te-IN",
-        "comparison": results,
-        "recommendation": {
-            "helpdesk_conversational": "te-IN-ShrutiNeural (warm female tone, highly rated for interactive student bots)",
-            "announcements_circulars": "te-IN-MohanNeural (formal male tone, clear and authoritative for administrative notices)"
-        }
-    }
+    # Auto: trust the language the STT picked; the text's script (Telugu letters) still wins inside handle_turn.
+    return handle_turn(db, agent, question=result.text[: settings.max_question_chars], language=language if language != "auto" else result.language,
+                       session_id=session_id, speak=speak, tts=tts, stt_ms=stt_ms, started=started)

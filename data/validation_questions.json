@@ -1,0 +1,18 @@
+[
+  {"question": "When is the last date to pay semester fees?", "answerable": true},
+  {"question": "What is the late fee after the due date?", "answerable": true},
+  {"question": "When do the mid-term examinations start?", "answerable": true},
+  {"question": "What is the minimum attendance needed for exams?", "answerable": true},
+  {"question": "What time does the hostel gate close?", "answerable": true},
+  {"question": "What are the mess timings?", "answerable": true},
+  {"question": "What time does bus route R1 leave?", "answerable": true},
+  {"question": "Which days are holidays in November?", "answerable": true},
+  {"question": "గ్రంథాలయం ఎప్పుడు తెరిచి ఉంటుంది?", "answerable": true},
+  {"question": "ఫీజు చెల్లించడానికి చివరి తేదీ ఎప్పుడు?", "answerable": true},
+  {"question": "What is the capital of France?", "answerable": false},
+  {"question": "Who won the cricket match yesterday?", "answerable": false},
+  {"question": "How do I bake a chocolate cake?", "answerable": false},
+  {"question": "What is the swimming pool timing?", "answerable": false},
+  {"question": "Does the college offer an MBA in aviation?", "answerable": false},
+  {"question": "What is the placement package for last year?", "answerable": false}
+]

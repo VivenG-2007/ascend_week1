@@ -1,121 +1,54 @@
-"""
-Authentication and JWT Security Services for Users & Admins
-"""
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-import bcrypt
+"""Admin authentication: bcrypt password hashes and short-lived HS256 JWTs."""
+from __future__ import annotations
+
 import hmac
-from jose import JWTError, jwt
-from fastapi import Header, HTTPException, status, Depends
-from sqlalchemy.orm import Session
-from app.config import settings
-from app.db.session import get_db
-from app.db.models import User
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
+import jwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.config import Settings, get_settings
+
+_bearer = HTTPBearer(auto_error=False)
+_DUMMY_HASH = bcrypt.hashpw(b"dummy-password", bcrypt.gensalt(rounds=4))
+
 
 def hash_password(password: str) -> str:
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password[:72].encode("utf-8"), salt).decode("utf-8")
+    return bcrypt.hashpw(password.encode()[:72], bcrypt.gensalt()).decode()
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
+
+def verify_password(password: str, hashed: str | None) -> bool:
     try:
-        return bcrypt.checkpw(plain_password[:72].encode("utf-8"), hashed_password.encode("utf-8"))
-    except Exception:
+        return bcrypt.checkpw(password.encode()[:72], (hashed or "").encode() or _DUMMY_HASH)
+    except ValueError:
         return False
 
-def create_access_token(data: dict, expires_minutes: Optional[int] = None) -> str:
-    to_encode = data.copy()
-    mins = expires_minutes or settings.JWT_EXPIRE_MINUTES
-    expire = datetime.utcnow() + timedelta(minutes=mins)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm="HS256")
 
-def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
+def authenticate(settings: Settings, username: str, password: str) -> bool:
+    """Constant-effort check: the bcrypt comparison always runs, even for a wrong username."""
+    user_ok = hmac.compare_digest(username.encode(), settings.admin_username.encode())
+    pw_ok = verify_password(password, settings.admin_password_hash if user_ok else None)
+    return user_ok and pw_ok
+
+
+def create_token(settings: Settings, subject: str, role: str = "admin") -> tuple[str, int]:
+    expires = timedelta(minutes=settings.jwt_expire_minutes)
+    now = datetime.now(timezone.utc)
+    token = jwt.encode({"sub": subject, "role": role, "iat": now, "exp": now + expires}, settings.jwt_secret, algorithm="HS256")
+    return token, int(expires.total_seconds())
+
+
+def require_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer), settings: Settings = Depends(get_settings)) -> str:
+    if not settings.jwt_secret:
+        raise HTTPException(status_code=503, detail="Admin access is not configured on this server.")
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Authentication required.", headers={"WWW-Authenticate": "Bearer"})
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
-        return payload
-    except JWTError:
-        return None
-
-def get_current_user(
-    authorization: Optional[str] = Header(None),
-    db: Session = Depends(get_db)
-) -> User:
-    """Dependency for strictly protected user routes."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication token required."
-        )
-    token = authorization.split(" ")[1]
-    payload = decode_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token."
-        )
-    user_id = payload.get("sub")
-    role = payload.get("role", "student")
-
-    # If it's the admin token
-    if role == "admin" and user_id == settings.ADMIN_USERNAME:
-        # Return synthetic admin user object
-        admin_user = User(
-            id="admin-001",
-            username=settings.ADMIN_USERNAME,
-            email="admin@gcet.edu.in",
-            full_name="System Administrator",
-            role="admin",
-            department="Administration"
-        )
-        return admin_user
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        # Fallback query by username
-        user = db.query(User).filter(User.username == user_id).first()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
-    return user
-
-def get_optional_current_user(
-    authorization: Optional[str] = Header(None),
-    db: Session = Depends(get_db)
-) -> Optional[Dict[str, Any]]:
-    """Dependency for public routes that optionally accept user context."""
-    if not authorization or not authorization.startswith("Bearer "):
-        return None
-    token = authorization.split(" ")[1]
-    payload = decode_access_token(token)
-    if not payload:
-        return None
-    
-    user_id = payload.get("sub")
-    role = payload.get("role", "student")
-
-    if role == "admin" and user_id == settings.ADMIN_USERNAME:
-        return {
-            "id": "admin-001",
-            "username": settings.ADMIN_USERNAME,
-            "full_name": "System Administrator",
-            "email": "admin@gcet.edu.in",
-            "role": "admin",
-            "phone": None,
-            "department": "Administration",
-            "student_id": None
-        }
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        user = db.query(User).filter(User.username == user_id).first()
-    if user:
-        return {
-            "id": user.id,
-            "username": user.username,
-            "full_name": user.full_name,
-            "email": user.email,
-            "role": user.role,
-            "phone": user.phone,
-            "department": user.department,
-            "student_id": user.student_id
-        }
-    return None
+        payload = jwt.decode(creds.credentials, settings.jwt_secret, algorithms=["HS256"], options={"require": ["exp", "sub"]})
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.", headers={"WWW-Authenticate": "Bearer"})
+    if payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="You do not have permission to do that.")
+    return str(payload["sub"])

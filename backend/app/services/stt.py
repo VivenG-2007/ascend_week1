@@ -1,57 +1,123 @@
+"""Azure AI Speech speech-to-text via the short-audio REST API.
+
+Language handling: the REST endpoint recognises ONE language per request. For `auto` we send the
+audio once per configured language (default en-IN and te-IN) in parallel and keep the result with
+the higher confidence. Code-mixed Telugu-English accuracy must be measured on real recordings.
 """
-Speech-to-Text (STT) Service
-Uses Azure AI Speech SDK to transcribe English and Telugu voice audio.
-"""
-import io
-import time
+from __future__ import annotations
+
 import logging
-from typing import Tuple
-from app.config import settings
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Protocol
 
-logger = logging.getLogger("campusvoice.stt")
+import httpx
 
-def transcribe_audio_bytes(audio_bytes: bytes, language_hint: str = "en") -> Tuple[str, str, float]:
-    """
-    Transcribes audio bytes to text using Azure AI Speech.
-    Returns (transcript_text, detected_language, stt_latency_ms).
-    """
-    start_time = time.perf_counter()
-    if not audio_bytes or len(audio_bytes) < 100:
-        raise ValueError("Audio data is empty or too short to process.")
+from app.config import Settings
 
-    target_lang = "te-IN" if language_hint == "te" else "en-IN"
+log = logging.getLogger("campusvoice.stt")
 
-    if settings.AZURE_SPEECH_KEY and settings.AZURE_SPEECH_REGION:
-        try:
-            import azure.cognitiveservices.speech as speechsdk
-            speech_config = speechsdk.SpeechConfig(
-                subscription=settings.AZURE_SPEECH_KEY,
-                region=settings.AZURE_SPEECH_REGION
+
+class SpeechError(Exception):
+    def __init__(self, message: str, empty: bool = False, unavailable: bool = False) -> None:
+        super().__init__(message)
+        self.message = message
+        self.empty = empty       # True when the audio was understood as silence / no speech
+        self.unavailable = unavailable  # True when speech is not configured on this server
+
+
+@dataclass
+class SttResult:
+    text: str
+    language: str  # "en" | "te"
+    locale: str
+    confidence: float | None
+
+
+class SpeechToText(Protocol):
+    def transcribe(self, wav: bytes, language: str = "auto") -> SttResult: ...
+
+
+def _short(locale: str) -> str:
+    return "te" if locale.lower().startswith("te") else "en"
+
+
+class AzureStt:
+    def __init__(self, settings: Settings, client: httpx.Client | None = None) -> None:
+        if not settings.azure_speech_configured:
+            raise SpeechError(
+                "Voice input is not set up on this server. Please type your question.",
+                unavailable=True,
             )
-            speech_config.speech_recognition_language = target_lang
+        self.s = settings
+        self.http = client or httpx.Client(timeout=20)
+        self.url = (
+            f"https://{settings.azure_speech_region}.stt.speech.microsoft.com"
+            "/speech/recognition/conversation/cognitiveservices/v1"
+        )
+        log.info("AzureStt ready: region=%s languages=%s", settings.azure_speech_region, settings.azure_speech_stt_languages)
 
-            # Use push stream or memory audio stream
-            push_stream = speechsdk.audio.PushAudioInputStream()
-            push_stream.write(audio_bytes)
-            push_stream.close()
+    def _locale_for(self, language: str) -> list[str]:
+        locales = self.s.stt_languages
+        if language == "auto":
+            return locales
+        match = [l for l in locales if _short(l) == language]
+        return match or [("te-IN" if language == "te" else "en-IN")]
 
-            audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
-            recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-            
-            result = recognizer.recognize_once_async().get()
+    def _recognise(self, wav: bytes, locale: str) -> SttResult | str:
+        log.debug("AzureStt._recognise: locale=%s audio=%d bytes", locale, len(wav))
+        try:
+            r = self.http.post(
+                self.url,
+                params={"language": locale, "format": "detailed", "profanity": "raw"},
+                content=wav,
+                headers={
+                    "Ocp-Apim-Subscription-Key": self.s.azure_speech_key or "",
+                    "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
+                    "Accept": "application/json",
+                },
+            )
+        except httpx.HTTPError as exc:
+            log.warning("AzureStt network error locale=%s: %s", locale, type(exc).__name__)
+            raise SpeechError("Could not reach the speech service. Please type your question instead.") from exc
 
-            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                transcript = result.text.strip()
-                stt_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                return transcript, language_hint, stt_ms
-            elif result.reason == speechsdk.ResultReason.NoMatch:
-                raise ValueError("No speech could be recognized. Please speak clearly.")
-            else:
-                logger.warning(f"[STT] Azure recognition canceled/failed: {result.cancellation_details.reason}")
-        except Exception as e:
-            logger.error(f"[STT] Azure Speech API error: {e}")
+        log.debug("AzureStt._recognise: HTTP %d locale=%s", r.status_code, locale)
 
-    # Fallback simulation if Azure Speech key not configured
-    stt_ms = round((time.perf_counter() - start_time) * 1000, 2)
-    demo_transcript = "ఫీజు వివరాలు ఏమిటి?" if language_hint == "te" else "When is the last date to pay fees?"
-    return demo_transcript, language_hint, max(1.0, stt_ms)
+        if r.status_code in (401, 403):
+            raise SpeechError("The speech service rejected our credentials. Please type your question instead.")
+        if r.status_code >= 400:
+            log.warning("AzureStt HTTP %s locale=%s", r.status_code, locale)
+            raise SpeechError("The speech service had a problem. Please type your question instead.")
+
+        body = r.json()
+        status = body.get("RecognitionStatus")
+        if status == "Success":
+            best = (body.get("NBest") or [{}])[0]
+            text = (best.get("Display") or body.get("DisplayText") or "").strip()
+            conf = best.get("Confidence")
+            log.debug("AzureStt: recognised locale=%s confidence=%.3f text=%r", locale, conf or 0, text[:80])
+            return SttResult(text, _short(locale), locale, conf)
+        log.debug("AzureStt: non-success status=%r locale=%s", status, locale)
+        return status or "Error"
+
+    def transcribe(self, wav: bytes, language: str = "auto") -> SttResult:
+        locales = self._locale_for(language)
+        log.info("AzureStt.transcribe: language=%s locales=%s audio=%d bytes", language, locales, len(wav))
+        with ThreadPoolExecutor(max_workers=len(locales)) as pool:
+            outcomes = list(pool.map(lambda loc: self._recognise(wav, loc), locales))
+        good = [o for o in outcomes if isinstance(o, SttResult) and o.text]
+        if good:
+            best = max(good, key=lambda o: o.confidence or 0.0)
+            log.info("AzureStt.transcribe: best locale=%s confidence=%.3f", best.locale, best.confidence or 0)
+            return best
+        statuses = {o for o in outcomes if isinstance(o, str)}
+        if statuses & {"NoMatch", "InitialSilenceTimeout"} or not statuses:
+            raise SpeechError(
+                "I could not hear any speech. Please try again or type your question.",
+                empty=True,
+            )
+        raise SpeechError("The speech service could not understand that audio. Please try again or type.")
+
+
+def get_stt(settings: Settings) -> SpeechToText:
+    return AzureStt(settings)

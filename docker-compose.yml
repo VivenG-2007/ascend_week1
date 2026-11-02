@@ -1,0 +1,10 @@
+# Optional local PostgreSQL that mimics Supabase, for testing migrations. (Not verified in the build environment: no Docker there.)
+# DATABASE_URL=postgresql://campusvoice:campusvoice@localhost:5432/campusvoice
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: campusvoice, POSTGRES_PASSWORD: campusvoice, POSTGRES_DB: campusvoice }
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+volumes:
+  pgdata:

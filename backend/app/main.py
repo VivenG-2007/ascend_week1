@@ -1,107 +1,135 @@
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from app.config import settings
-from app.db.session import engine, Base
-from app.db.seed import seed_database
-from app.schemas.chat import HealthResponse
-from app.routers.chat import router as chat_router
-from app.routers.voice import router as voice_router
-from app.routers.admin import router as admin_router
-from app.routers.auth import router as auth_router
-from app.services.cloud_status import get_full_cloud_diagnostics, check_supabase_cloud, check_chromadb_cloud
+from sqlalchemy.exc import SQLAlchemyError
 
-logger = logging.getLogger("campusvoice")
+from app.config import get_settings
+from app.routers import admin, chat, documents, health, voice
+
+log = logging.getLogger("campusvoice")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Log College name and configuration
-    print("=" * 60)
-    print(f" CAMPUSVOICE: {settings.COLLEGE_NAME}")
-    print("=" * 60)
-    
-    # Startup diagnostics
-    cloud_diag = get_full_cloud_diagnostics()
-    print(f"[CLOUD LOG] Database Engine: {cloud_diag['supabase']['database_type']}")
-    print(f"[CLOUD LOG] Database Status: {'CONNECTED' if cloud_diag['supabase']['database_connected'] else 'DISCONNECTED'}")
-    print(f"[CLOUD LOG] Supabase Storage: {'CONNECTED' if cloud_diag['supabase']['storage_connected'] else 'LOCAL FALLBACK'}")
-    print(f"[CLOUD LOG] ChromaDB Engine: {cloud_diag['chromadb']['chroma_type']}")
-    print(f"[CLOUD LOG] ChromaDB Status: {'CONNECTED' if cloud_diag['chromadb']['connected'] else 'ERROR'}")
-    print("=" * 60)
+    settings = get_settings()
+    # Force=True so uvicorn's existing handlers don't swallow our records.
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s %(levelname)-8s %(name)-30s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        force=True,
+    )
+    log.info(
+        "═══ CampusVoice starting up ═══ env=%s college=%r db=%s origins=%s",
+        settings.app_env,
+        settings.college_name,
+        settings.safe_database_description,
+        settings.cors_origins,
+    )
+    log.info(
+        "Config: embedding=%s ocr=%s storage=%s agent=%s speech=%s",
+        settings.embedding_provider,
+        settings.ocr_provider,
+        "supabase" if settings.supabase_url else "local",
+        "azure" if settings.azure_llm_configured else "offline",
+        "azure" if settings.azure_speech_configured else "disabled",
+    )
+    if settings.chroma_cloud_configured:
+        log.info("ChromaDB: Chroma Cloud tenant=%s database=%s", settings.chroma_tenant, settings.chroma_database)
+    elif settings.chroma_host:
+        log.info("ChromaDB: self-hosted host=%s:%d ssl=%s", settings.chroma_host, settings.chroma_port, settings.chroma_ssl)
+    else:
+        log.info("ChromaDB: local path=%s", settings.chroma_persist_directory)
 
-    # Ensure clean tables exist without seeding mock records
-    try:
-        Base.metadata.create_all(bind=engine)
-        print("[DATABASE] Relational schema tables initialized cleanly (no auto-seeded records).")
-    except Exception as e:
-        print(f"[ERROR] Database initialization failed: {e}")
-
+    if settings.app_env != "test":
+        _warm_up()
     yield
+    log.info("═══ CampusVoice shut down ═══")
 
-app = FastAPI(
-    title=f"CampusVoice API - {settings.COLLEGE_NAME}",
-    description="Multilingual Voice AI Helpdesk for College Information",
-    version="1.0.0",
-    lifespan=lifespan
-)
 
-# CORS configuration
-origins = [
-    settings.FRONTEND_ORIGIN,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+def _warm_up() -> None:
+    """Load heavy, reusable services once at startup (not per request). Failures are loud but not fatal for text chat."""
+    log.info("Warm-up: loading services...")
+    for name, loader in (
+        ("embedder", "app.services.embeddings:get_embedder"),
+        ("vector store", "app.services.vectorstore:get_vectorstore"),
+        ("ocr", "app.services.ocr:get_ocr"),
+        ("storage", "app.services.storage:get_storage"),
+    ):
+        module, fn = loader.split(":")
+        try:
+            svc = getattr(__import__(module, fromlist=[fn]), fn)()
+            log.info("Warm-up: %-20s ready  (%s)", name, getattr(svc, "name", type(svc).__name__))
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Warm-up: %-20s FAILED — document search will be unavailable until this is fixed",
+                name,
+            )
+    if get_settings().auto_reindex:
+        _auto_reindex()
+    log.info("Warm-up: complete")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# Global safe error handling
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An internal server error occurred. Please contact the administrator."}
+def _auto_reindex() -> None:
+    from app.db.session import get_sessionmaker
+    from app.scripts.reindex import processed_chunk_count, reindex
+    from app.services.embeddings import get_embedder
+    from app.services.vectorstore import get_vectorstore
+
+    try:
+        vectors = get_vectorstore()
+        with get_sessionmaker()() as db:
+            expected = processed_chunk_count(db)
+            actual = vectors.count()
+            if expected > actual:
+                log.warning(
+                    "Auto-reindex: vector index has %d of %d chunks — rebuilding from database",
+                    actual,
+                    expected,
+                )
+                count = reindex(db, get_embedder(), vectors)
+                log.info("Auto-reindex: reindexed %d chunk(s) successfully", count)
+            else:
+                log.info("Auto-reindex: index is up-to-date (%d chunks)", actual)
+    except Exception:  # noqa: BLE001
+        log.exception("Auto-reindex: failed — run `python -m app.scripts.reindex` manually")
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()  # fails fast on invalid configuration
+    app = FastAPI(title="CampusVoice API", version="0.1.0", lifespan=lifespan)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
-# Routers
-app.include_router(chat_router)
-app.include_router(voice_router)
-app.include_router(admin_router)
-app.include_router(auth_router)
+    @app.exception_handler(SQLAlchemyError)
+    async def _db_error(_: Request, exc: SQLAlchemyError) -> JSONResponse:
+        log.exception("Database error")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "The database is unavailable. Please try again shortly."},
+        )
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
-def health_check():
-    supabase_info = check_supabase_cloud()
-    chroma_info = check_chromadb_cloud()
+    @app.exception_handler(Exception)
+    async def _unhandled(_: Request, exc: Exception) -> JSONResponse:
+        log.exception("Unhandled error")
+        return JSONResponse(
+            status_code=500, content={"detail": "Something went wrong on our side."}
+        )
 
-    db_status = "connected" if supabase_info["database_connected"] else f"unhealthy: {supabase_info['detail']}"
+    app.include_router(health.router)
+    app.include_router(chat.router)
+    app.include_router(voice.router)
+    app.include_router(documents.router)
+    app.include_router(admin.router)
+    return app
 
-    return HealthResponse(
-        status="ok" if supabase_info["database_connected"] else "degraded",
-        app="CampusVoice",
-        college_name=settings.COLLEGE_NAME,
-        database=db_status,
-        database_type=supabase_info["database_type"],
-        supabase_storage="connected" if supabase_info["storage_connected"] else "not_configured (using local)",
-        chromadb_type=chroma_info["chroma_type"],
-        chromadb_status="connected" if chroma_info["connected"] else f"failed: {chroma_info['detail']}",
-        timestamp=datetime.utcnow().isoformat()
-    )
 
-@app.get("/api/cloud/status", tags=["Cloud Diagnostics"])
-def cloud_diagnostics():
-    """Returns detailed real-time connectivity status and logs for Supabase Cloud and ChromaDB Cloud."""
-    return get_full_cloud_diagnostics()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+app = create_app()

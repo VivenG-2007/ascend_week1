@@ -1,222 +1,250 @@
-"""
-Document Ingestion Pipeline
-Handles file validation, hashing, storage, text extraction, OCR, chunking,
-multilingual E5 embeddings, and dual persistence (Supabase/SQLite & ChromaDB).
-"""
+"""PDF / image ingestion: validate, store original, extract (text layer or OCR), chunk, embed,
+persist canonical text in the relational DB, index vectors in ChromaDB.
+
+A document is marked `processed` only when persistence AND indexing both succeeded."""
+from __future__ import annotations
+
 import hashlib
-import re
 import logging
-from typing import Dict, Any, List, Optional
+import uuid
+from dataclasses import dataclass, field
+from datetime import date
+
+import pymupdf as fitz  # PyMuPDF
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.config import settings
-from app.db.models import Document, DocumentPage, Chunk
-from app.services.storage import save_document_file
-from app.services.ocr import extract_text_from_pdf_stream, extract_text_from_image_stream
-from app.services.embeddings import generate_passage_embeddings
 
-logger = logging.getLogger("campusvoice.ingestion")
+from app.db.models import Chunk, Document, DocumentPage, DocumentStatus, ExtractionStatus
+from app.services.chunking import chunk_pages
+from app.services.embeddings import Embedder
+from app.services.language import detect_language
+from app.services.ocr import OcrProvider, OcrUnavailable
+from app.services.storage import Storage, safe_filename
+from app.services.text_clean import clean_text
+from app.services.vectorstore import VectorStore
 
-def compute_sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+log = logging.getLogger("campusvoice.ingest")
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """
-    Splits text into approximately 500-token chunks with overlap.
-    Uses whitespace word-boundary approximation (~0.75 tokens per word).
-    """
-    words = text.split()
-    if not words:
-        return []
-    
-    # Approx 375 words for 500 tokens
-    target_words = int(chunk_size * 0.75)
-    overlap_words = int(overlap * 0.75)
-    
-    chunks = []
-    i = 0
-    while i < len(words):
-        chunk_words = words[i:i + target_words]
-        chunk_str = " ".join(chunk_words)
-        chunks.append(chunk_str)
-        i += (target_words - overlap_words)
-        if i <= 0 or i >= len(words):
-            break
-            
-    return chunks
+MIN_TEXT_CHARS = 25  # a PDF page with less text than this is treated as scanned
+OCR_DPI = 200
+SIGNATURES = {
+    "application/pdf": (b"%PDF-",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+}
+ALIASES = {"image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg"}
+
+
+class UploadRejected(Exception):
+    def __init__(self, message: str, status_code: int = 422) -> None:
+        super().__init__(message)
+        self.message, self.status_code = message, status_code
+
+
+@dataclass
+class IngestionDeps:
+    storage: Storage
+    ocr: OcrProvider
+    embedder: Embedder
+    vectors: VectorStore
+
+
+@dataclass
+class IngestionReport:
+    document_id: str
+    status: str
+    extraction_status: str
+    pages: int = 0
+    ocr_pages: int = 0
+    chunks: int = 0
+    warnings: list[str] = field(default_factory=list)
+    error: str | None = None
+    duration_ms: int = 0
+
+
+def validate_upload(filename: str, declared_mime: str | None, data: bytes, max_bytes: int) -> str:
+    """Return the verified MIME type. Checks size, declared type AND file signature."""
+    if not data:
+        raise UploadRejected("The uploaded file is empty.")
+    if len(data) > max_bytes:
+        raise UploadRejected(f"File is larger than {max_bytes // (1024 * 1024)} MB.", 413)
+    mime = ALIASES.get((declared_mime or "").lower(), (declared_mime or "").lower())
+    if mime not in SIGNATURES:
+        raise UploadRejected("Unsupported file type. Upload a PDF, JPG or PNG.", 415)
+    if not any(data.startswith(sig) for sig in SIGNATURES[mime]):
+        raise UploadRejected("The file content does not match its declared type.", 415)
+    return mime
+
+
+@dataclass
+class _Page:
+    number: int
+    text: str
+    method: str  # text | ocr
+    ocr_status: str  # not_needed | ok | low_quality | failed
+    warnings: list[str]
+
+
+def _ocr_png(png: bytes, ocr: OcrProvider) -> tuple[str, str, list[str]]:
+    try:
+        res = ocr.ocr_image(png)
+    except OcrUnavailable as exc:
+        return "", "failed", [f"OCR unavailable: {exc}"]
+    except Exception as exc:  # noqa: BLE001
+        log.exception("OCR crashed")
+        return "", "failed", [f"OCR failed: {type(exc).__name__}"]
+    text = clean_text(res.text)
+    if not text:
+        return "", "failed", res.warnings or ["OCR found no readable text."]
+    status = "low_quality" if any("Low OCR confidence" in w for w in res.warnings) else "ok"
+    return text, status, res.warnings
+
+
+def _extract_pdf(data: bytes, ocr: OcrProvider) -> list[_Page]:
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        raise UploadRejected("The PDF could not be opened. It may be corrupted or password-protected.") from exc
+    if doc.needs_pass:
+        raise UploadRejected("Password-protected PDFs are not supported.")
+    pages: list[_Page] = []
+    for i, page in enumerate(doc, start=1):
+        text = clean_text(page.get_text("text"))
+        if len(text) >= MIN_TEXT_CHARS:
+            pages.append(_Page(i, text, "text", "not_needed", []))
+            continue
+        png = page.get_pixmap(dpi=OCR_DPI).tobytes("png")
+        ocr_text, status, warns = _ocr_png(png, ocr)
+        pages.append(_Page(i, ocr_text, "ocr", status, [f"Page {i}: {w}" for w in warns]))
+    return pages
+
+
+def _extract_image(data: bytes, ocr: OcrProvider) -> list[_Page]:
+    try:
+        pix = fitz.Pixmap(data)
+        png = pix.tobytes("png")
+    except Exception as exc:  # noqa: BLE001
+        raise UploadRejected("The image could not be read.") from exc
+    text, status, warns = _ocr_png(png, ocr)
+    return [_Page(1, text, "ocr", status, warns)]
+
 
 def ingest_document(
-    file_bytes: bytes,
+    db: Session,
+    deps: IngestionDeps,
+    *,
+    data: bytes,
     filename: str,
-    content_type: str,
+    declared_mime: str | None,
     title: str,
     category: str,
     department: str,
-    source_date: str,
-    db: Session,
-    replaces_doc_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Executes the full ingestion pipeline.
-    """
-    # 1. Validation
-    size_mb = len(file_bytes) / (1024 * 1024)
-    if size_mb > settings.MAX_UPLOAD_MB:
-        raise ValueError(f"File size ({size_mb:.2f} MB) exceeds maximum limit of {settings.MAX_UPLOAD_MB} MB.")
+    source_date: date,
+    supersedes_id: str | None = None,
+    max_bytes: int = 15 * 1024 * 1024,
+) -> IngestionReport:
+    import time
 
-    content_hash = compute_sha256(file_bytes)
+    started = time.perf_counter()
+    mime = validate_upload(filename, declared_mime, data, max_bytes)
+    content_hash = hashlib.sha256(data).hexdigest()
 
-    # 2. Duplicate detection
-    existing = db.query(Document).filter(Document.content_hash == content_hash).first()
-    if existing:
-        logger.warning(f"[INGESTION] Duplicate file detected (hash: {content_hash}). Document ID: {existing.id}")
-        return {
-            "document_id": existing.id,
-            "status": "duplicate",
-            "message": f"This document has already been indexed as '{existing.title}'.",
-            "chunks_indexed": len(existing.chunks)
-        }
+    existing = db.scalar(select(Document).where(Document.content_hash == content_hash))
+    if existing is not None:
+        if existing.processing_status != DocumentStatus.failed.value:
+            raise UploadRejected(f"This file was already uploaded (document {existing.id}).", 409)
+        deps.vectors.delete_document(existing.id)  # retry a failed upload from scratch
+        db.delete(existing)
+        db.commit()
 
-    # 3. Save File to Supabase Storage / Local
-    file_url, storage_path = save_document_file(file_bytes, filename, content_type)
+    if supersedes_id is not None and db.get(Document, supersedes_id) is None:
+        raise UploadRejected("The document to supersede does not exist.")
 
-    # 4. Create Document Record
+    doc_id = str(uuid.uuid4())
+    clean_name = safe_filename(filename)
+    storage_path = f"documents/{doc_id}/{clean_name}"
     doc = Document(
-        title=title,
-        category=category,
-        department=department,
-        source_date=source_date,
-        file_url=file_url,
-        content_hash=content_hash,
-        processing_status="processing",
-        extraction_status="none"
+        id=doc_id, title=title.strip(), category=category.strip(), department=department.strip(), source_date=source_date,
+        original_filename=clean_name, mime_type=mime, file_size_bytes=len(data), content_hash=content_hash,
+        processing_status=DocumentStatus.processing.value, extraction_status=ExtractionStatus.pending.value,
+        supersedes_id=supersedes_id,
     )
     db.add(doc)
     db.commit()
-    db.refresh(doc)
+    report = IngestionReport(document_id=doc_id, status=DocumentStatus.processing.value, extraction_status="pending")
 
-    # 5. Extract Text & OCR
-    is_pdf = "pdf" in content_type.lower() or filename.lower().endswith(".pdf")
-    is_txt = "text" in content_type.lower() or filename.lower().endswith(".txt")
-
-    if is_pdf:
-        pages = extract_text_from_pdf_stream(file_bytes)
-        extraction_type = "ocr_fallback" if any(p["ocr_applied"] for p in pages) else "native_pdf"
-    elif is_txt:
-        p_text = file_bytes.decode("utf-8", errors="ignore").strip()
-        pages = [{
-            "page_number": 1,
-            "text": p_text,
-            "ocr_applied": False,
-            "warnings": None
-        }]
-        extraction_type = "plain_text"
-    else:
-        # Image (JPG / PNG)
-        img_page = extract_text_from_image_stream(file_bytes, content_type)
-        pages = [img_page]
-        extraction_type = "ocr_image"
-
-    doc.extraction_status = extraction_type
-
-    all_chunks_text = []
-    chunk_meta_list = []
-
-    # 6. Save Pages & Create Chunks
-    for p in pages:
-        page_record = DocumentPage(
-            document_id=doc.id,
-            page_number=p["page_number"],
-            extracted_text=p["text"],
-            ocr_status="ocr_applied" if p["ocr_applied"] else "none",
-            warnings=p.get("warnings")
-        )
-        db.add(page_record)
-
-        if p["text"]:
-            text_chunks = chunk_text(p["text"], settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
-            for idx, c_text in enumerate(text_chunks):
-                all_chunks_text.append(c_text)
-                chunk_meta_list.append({
-                    "document_id": doc.id,
-                    "page_number": p["page_number"],
-                    "chunk_index": idx,
-                    "title": title,
-                    "department": department,
-                    "source_date": source_date,
-                    "replaces_doc_id": replaces_doc_id or ""
-                })
-
-    db.commit()
-
-    # 7. Generate Multilingual E5 Embeddings & Index in ChromaDB
-    indexed_count = 0
-    if all_chunks_text:
-        embeddings = generate_passage_embeddings(all_chunks_text)
-        
-        # Save canonical chunk records in DB
-        for c_text, meta in zip(all_chunks_text, chunk_meta_list):
-            chunk_rec = Chunk(
-                document_id=doc.id,
-                page_number=meta["page_number"],
-                chunk_index=meta["chunk_index"],
-                content=c_text,
-                vector_metadata=meta
-            )
-            db.add(chunk_rec)
-        db.commit()
-
-        # Add to ChromaDB
+    def fail(message: str) -> IngestionReport:
+        db.rollback()
         try:
-            import chromadb
-            if settings.CHROMA_SERVER_HOST:
-                headers = {"x-chroma-token": settings.CHROMA_CLOUD_API_KEY} if settings.CHROMA_CLOUD_API_KEY else {}
-                chroma_client = chromadb.HttpClient(
-                    host=settings.CHROMA_SERVER_HOST,
-                    port=settings.CHROMA_SERVER_HTTP_PORT or (443 if settings.CHROMA_SERVER_SSL_ENABLED else 8000),
-                    ssl=settings.CHROMA_SERVER_SSL_ENABLED,
-                    headers=headers
-                )
-            else:
-                chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIRECTORY)
+            deps.vectors.delete_document(doc_id)
+        except Exception:  # noqa: BLE001
+            log.exception("Could not clean vectors after failure")
+        d = db.get(Document, doc_id)
+        if d is not None:
+            d.processing_status = DocumentStatus.failed.value
+            d.extraction_status = report.extraction_status if report.extraction_status != "pending" else ExtractionStatus.failed.value
+            d.error_message = message[:1000]
+            db.commit()
+        report.status, report.error = DocumentStatus.failed.value, message
+        report.duration_ms = round((time.perf_counter() - started) * 1000)
+        return report
 
-            collection = chroma_client.get_or_create_collection(
-                name=settings.CHROMA_COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"}
-            )
+    try:
+        deps.storage.save(storage_path, data, mime)
+        doc.storage_path = storage_path
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Storing original failed")
+        return fail(f"Could not store the original file: {type(exc).__name__}")
 
-            ids = [f"{doc.id}_p{m['page_number']}_c{m['chunk_index']}" for m in chunk_meta_list]
-            chroma_client_metas = [
-                {
-                    "document_id": m["document_id"],
-                    "page_number": m["page_number"],
-                    "title": m["title"],
-                    "department": m["department"],
-                    "source_date": m["source_date"],
-                    "replaces": m.get("replaces_doc_id", "")
-                }
-                for m in chunk_meta_list
-            ]
+    try:
+        pages = _extract_pdf(data, deps.ocr) if mime == "application/pdf" else _extract_image(data, deps.ocr)
+    except UploadRejected as exc:
+        return fail(exc.message)
 
-            collection.add(
-                ids=ids,
-                documents=all_chunks_text,
-                embeddings=embeddings,
-                metadatas=chroma_client_metas
-            )
-            indexed_count = len(ids)
-            logger.info(f"[INGESTION] Successfully indexed {indexed_count} chunks into ChromaDB for '{title}'.")
-        except Exception as e:
-            logger.error(f"[INGESTION] Failed to index chunks in ChromaDB: {e}")
+    report.pages = len(pages)
+    report.ocr_pages = sum(1 for p in pages if p.method == "ocr")
+    for p in pages:
+        report.warnings += p.warnings
+    readable = [p for p in pages if p.text.strip()]
+    unreadable = len(pages) - len(readable)
+    if not readable:
+        report.extraction_status = ExtractionStatus.failed.value
+        return fail("No readable text could be extracted from this file.")
+    report.extraction_status = ExtractionStatus.partial.value if (unreadable or any(p.ocr_status == "low_quality" for p in pages)) else ExtractionStatus.ok.value
+    if unreadable:
+        report.warnings.append(f"{unreadable} of {len(pages)} pages had no readable text.")
 
-    doc.processing_status = "completed"
-    db.commit()
+    try:
+        full_text = "\n".join(p.text for p in readable)
+        doc.language = detect_language(full_text)
+        for p in pages:
+            db.add(DocumentPage(document_id=doc_id, page_number=p.number, extracted_text=p.text,
+                                extraction_method=p.method, ocr_status=p.ocr_status, warnings=p.warnings or None))
+        drafts = chunk_pages([(p.number, p.text) for p in readable])
+        chunk_rows = [Chunk(id=str(uuid.uuid4()), document_id=doc_id, page_number=d.page_number,
+                            chunk_index=d.chunk_index, content=d.content, token_count=d.token_count) for d in drafts]
+        db.add_all(chunk_rows)
+        db.flush()
+        vectors = deps.embedder.embed_passages([c.content for c in chunk_rows])
+        meta = {"document_id": doc_id, "title": doc.title, "department": doc.department, "category": doc.category,
+                "source_date": source_date.isoformat()}
+        deps.vectors.upsert(
+            ids=[c.id for c in chunk_rows], embeddings=vectors, documents=[c.content for c in chunk_rows],
+            metadatas=[{**meta, "page_number": c.page_number, "chunk_index": c.chunk_index} for c in chunk_rows],
+        )
+        for c in chunk_rows:
+            c.vector_id = c.id
+        if deps.vectors.count_document(doc_id) != len(chunk_rows):
+            raise RuntimeError("Vector index count does not match stored chunks")
+        doc.extraction_status = report.extraction_status
+        doc.processing_status = DocumentStatus.processed.value
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Persistence/indexing failed")
+        return fail(f"Indexing failed: {type(exc).__name__}: {str(exc)[:200]}")
 
-    return {
-        "document_id": doc.id,
-        "title": title,
-        "status": "completed",
-        "extraction_status": extraction_type,
-        "pages_processed": len(pages),
-        "chunks_indexed": indexed_count,
-        "warnings": [p["warnings"] for p in pages if p.get("warnings")]
-    }
+    report.status = DocumentStatus.processed.value
+    report.chunks = len(chunk_rows)
+    report.duration_ms = round((time.perf_counter() - started) * 1000)
+    return report

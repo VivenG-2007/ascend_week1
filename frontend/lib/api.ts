@@ -1,171 +1,118 @@
-export interface SourceCitation {
+export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+
+export type Lang = "en" | "te";
+export type LangChoice = "auto" | Lang;
+
+export interface SourceRef {
+  document_id: string;
   title: string;
-  department?: string;
-  source_date?: string;
-  page_number?: number;
-  document_id?: string;
-  replaces?: string;
-  superseded?: boolean;
+  source_date: string | null;
+  page_number: number | null;
+  department: string | null;
+  score: number | null;
+  superseded_note: string | null;
 }
-
-export interface TicketInfo {
-  id: string;
-  question: string;
-  department: string;
-  status: string;
-  summary?: string;
-  created_at?: string;
-  user_name?: string;
-  user_email?: string;
-  user_phone?: string;
-}
-
+export interface TicketInfo { id: string; department: string; status: string; summary: string | null }
 export interface ChatResponse {
+  session_id: string;
   transcript: string;
-  language: string;
+  language: Lang;
   answer_text: string;
-  audio_base64?: string | null;
-  audio_url?: string | null;
-  sources: SourceCitation[];
-  ticket?: TicketInfo | null;
-  confidence?: number;
+  audio_base64: string | null;
+  sources: SourceRef[];
+  ticket: TicketInfo | null;
+  retrieval: { decision: string | null; top_score: number | null } | null;
   latency_ms: number;
-  stt_ms?: number;
-  llm_ms: number;
-  tts_ms?: number;
+  stt_ms: number | null;
+  llm_ms: number | null;
+  tts_ms: number | null;
+  warnings: string[];
+}
+export interface Health { status: "ok" | "degraded"; college_name: string; detail: string | null; services: Record<string, string> }
+
+export class ApiError extends Error {
+  constructor(message: string, public status?: number) { super(message); }
 }
 
-export interface HealthResponse {
-  status: string;
-  app: string;
-  college_name: string;
-  database: string;
-  database_type?: string;
-  supabase_storage?: string;
-  chromadb_type?: string;
-  chromadb_status?: string;
-  timestamp: string;
-}
+export const TOKEN_KEY = "cv_admin_token";
+const getToken = () => (typeof window === "undefined" ? null : window.sessionStorage.getItem(TOKEN_KEY));
 
-export interface UserProfile {
-  id: string;
-  username: string;
-  email: string;
-  full_name: string;
-  role: string; // student, faculty, parent, visitor, admin
-  department?: string;
-  phone?: string;
-  student_id?: string;
-  created_at?: string;
-}
-
-export interface AuthResponse {
-  access_token: string;
-  token_type: string;
-  user: UserProfile;
-}
-
-export interface UserTicket {
-  id: string;
-  question: string;
-  department: string;
-  status: string;
-  resolution_note?: string;
-  created_at?: string;
-  resolved_at?: string;
-}
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
-export async function fetchHealth(): Promise<HealthResponse> {
-  const res = await fetch(`${API_BASE}/health`, {
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    throw new Error(`Health check failed with status: ${res.status}`);
+async function request<T>(path: string, init: RequestInit = {}, opts: { timeoutMs?: number; auth?: boolean } = {}): Promise<T> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 30000);
+  const headers = new Headers(init.headers);
+  if (opts.auth) { const t = getToken(); if (t) headers.set("Authorization", `Bearer ${t}`); }
+  try {
+    const res = await fetch(`${API_URL}${path}`, { ...init, headers, signal: ctrl.signal });
+    if (!res.ok) {
+      let detail = "The server could not process that request.";
+      try {
+        const body = await res.json();
+        if (typeof body.detail === "string") detail = body.detail;
+        else if (Array.isArray(body.detail) && body.detail[0]?.msg) detail = String(body.detail[0].msg);
+      } catch { /* non-JSON error body */ }
+      throw new ApiError(detail, res.status);
+    }
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof DOMException && err.name === "AbortError") throw new ApiError("The request timed out. Try again.");
+    throw new ApiError("Cannot reach the CampusVoice server. Check that the backend is running.");
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
-export async function loginUser(username: string, password: string): Promise<AuthResponse> {
-  const res = await fetch(`${API_BASE}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Login failed");
-  }
-  return res.json();
+const json = (body: unknown): RequestInit => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+// ---------------------------------------------------------------- public
+export const getHealth = () => request<Health>("/health", {}, { timeoutMs: 8000 });
+export const sendChat = (body: { question: string; session_id?: string; language: LangChoice; speak?: boolean }) =>
+  request<ChatResponse>("/api/chat", json(body));
+export function sendVoice(wav: Blob, language: LangChoice, sessionId?: string) {
+  const f = new FormData();
+  f.append("audio", wav, "recording.wav");
+  f.append("language", language);
+  f.append("speak", "true");
+  if (sessionId) f.append("session_id", sessionId);
+  return request<ChatResponse>("/api/voice", { method: "POST", body: f }, { timeoutMs: 45000 });
 }
+export const documentFileUrl = (id: string, page?: number | null) => `${API_URL}/api/documents/${id}/file${page ? `#page=${page}` : ""}`;
 
-export async function registerUser(payload: {
-  username: string;
-  email: string;
-  password: string;
-  full_name: string;
-  role?: string;
-  department?: string;
-  phone?: string;
-  student_id?: string;
-}): Promise<AuthResponse> {
-  const res = await fetch(`${API_BASE}/api/auth/register`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Registration failed");
-  }
-  return res.json();
+// ----------------------------------------------------------------- admin
+export interface AdminDocument {
+  id: string; title: string; category: string; department: string; source_date: string; language: string | null;
+  processing_status: string; extraction_status: string; original_filename: string | null; page_count: number; ocr_pages: number;
+  chunk_count: number; warnings: string[]; error_message: string | null; supersedes_id: string | null; superseded_by_id: string | null; created_at: string;
 }
-
-export async function fetchMyTickets(token: string): Promise<UserTicket[]> {
-  const res = await fetch(`${API_BASE}/api/auth/my-tickets`, {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Failed to fetch user tickets");
-  }
-  return res.json();
+export interface UploadReport { document: AdminDocument; pages: number; ocr_pages: number; chunks: number; warnings: string[]; error: string | null; duration_ms: number }
+export interface AdminTicket {
+  id: string; question: string; summary: string | null; transcript: string | null; language: string; department: string; status: string;
+  resolution_note: string | null; created_at: string; updated_at: string; resolved_at: string | null;
 }
-
-export async function sendChatMessage(
-  message: string,
-  language: string = "en",
-  sessionId?: string,
-  token?: string,
-  userInfo?: Partial<UserProfile>
-): Promise<ChatResponse> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  const res = await fetch(`${API_BASE}/api/chat`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      message,
-      language,
-      session_id: sessionId,
-      user_id: userInfo?.id,
-      user_name: userInfo?.full_name,
-      user_email: userInfo?.email,
-      user_phone: userInfo?.phone,
-    }),
-  });
-
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || `Chat request failed: ${res.status}`);
-  }
-
-  return res.json();
+export interface Analytics {
+  totals: { questions: number; tickets: number; documents: number };
+  top_questions: { question: string; count: number }[];
+  unanswered_questions: { ticket_id: string; question: string; department: string; status: string; created_at: string }[];
+  tickets_by_status: Record<string, number>; tickets_by_department: Record<string, number>; language_usage: Record<string, number>;
+  latency: Record<string, { count: number; average_ms: number | null; median_ms: number | null }>;
+  retrieval_confidence: { buckets: { range: string; count: number }[]; decisions: Record<string, number> };
+  document_failures: { id: string; title: string; error: string | null; created_at: string }[];
 }
+export const DEPARTMENTS = ["Exam Cell", "Accounts", "Hostel", "Transport", "Library", "Admissions", "General"];
+
+export async function adminLogin(username: string, password: string) {
+  const r = await request<{ access_token: string }>("/api/admin/login", json({ username, password }));
+  window.sessionStorage.setItem(TOKEN_KEY, r.access_token);
+}
+export const adminLogout = () => window.sessionStorage.removeItem(TOKEN_KEY);
+export const hasToken = () => !!getToken();
+export const listDocuments = () => request<AdminDocument[]>("/api/admin/documents", {}, { auth: true });
+export const uploadDocument = (form: FormData) => request<UploadReport>("/api/admin/documents", { method: "POST", body: form }, { auth: true, timeoutMs: 120000 });
+export const listTickets = (department?: string, status?: string) => {
+  const q = new URLSearchParams(); if (department) q.set("department", department); if (status) q.set("status", status);
+  return request<{ total: number; items: AdminTicket[] }>(`/api/admin/tickets?${q}`, {}, { auth: true });
+};
+export const patchTicket = (id: string, body: { status?: string; resolution_note?: string }) =>
+  request<AdminTicket>(`/api/admin/tickets/${id}`, { ...json(body), method: "PATCH" }, { auth: true });
+export const getAnalytics = () => request<Analytics>("/api/admin/analytics", {}, { auth: true });

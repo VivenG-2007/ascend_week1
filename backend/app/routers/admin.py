@@ -1,337 +1,175 @@
-"""
-Admin Router for CampusVoice Helpdesk
-Provides JWT protected endpoints for document uploads, ticket resolution, and structured data entry.
-"""
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Header
+import statistics
+from collections import Counter
+from datetime import date
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from sqlalchemy import func
-from pydantic import BaseModel
-from jose import JWTError, jwt
-import hmac
-import bcrypt
-from app.config import settings
+
+from app.config import Settings, get_settings
+from app.db.models import Chunk, Document, DocumentPage, DocumentStatus, Message, MessageRole, Ticket, TicketDepartment, TicketStatus, utcnow
 from app.db.session import get_db
-from app.db.models import Document, Ticket, Faculty, Timetable, Exam, Event, Message
-from app.services.ingestion import ingest_document
+from app.deps import get_ingestion_deps
+from app.schemas.admin import DocumentOut, DocumentPatch, LoginRequest, TicketList, TicketOut, TicketPatch, TokenResponse, UploadReport
+from app.services.auth import authenticate, create_token, require_admin
+from app.services.ingestion import IngestionDeps, UploadRejected, ingest_document
+from app.services.ratelimit import login_limit
 
-router = APIRouter(prefix="/api/admin", tags=["Admin"])
+router = APIRouter(prefix="/api/admin", tags=["admin"])
+protected = [Depends(require_admin)]
+DEPARTMENTS = [d.value for d in TicketDepartment]
 
-def verify_admin_password(plain_password: str) -> bool:
-    if hmac.compare_digest(plain_password, "admin123"):
-        return True
-    try:
-        return bcrypt.checkpw(plain_password[:72].encode("utf-8"), settings.ADMIN_PASSWORD_HASH.encode("utf-8"))
-    except Exception:
-        return False
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+@router.post("/login", response_model=TokenResponse, dependencies=[Depends(login_limit)])
+def login(body: LoginRequest, settings: Settings = Depends(get_settings)) -> TokenResponse:
+    if not settings.jwt_secret or not settings.admin_password_hash:
+        raise HTTPException(503, "Admin access is not configured on this server.")
+    if not authenticate(settings, body.username, body.password):
+        raise HTTPException(401, "Incorrect username or password.")
+    token, ttl = create_token(settings, body.username)
+    return TokenResponse(access_token=token, expires_in=ttl)
 
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int
 
-class TicketUpdateRequest(BaseModel):
-    status: Optional[str] = None
-    resolution_note: Optional[str] = None
+# ---------------------------------------------------------------------------- documents
 
-class FacultyCreateRequest(BaseModel):
-    name: str
-    department: str
-    designation: str
-    cabin: str
-    block: str
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    office_hours: Optional[str] = None
 
-class TimetableCreateRequest(BaseModel):
-    section: str
-    day: str
-    period: int
-    start_time: str
-    end_time: str
-    subject: str
-    room: str
-    faculty_id: Optional[str] = None
+def _doc_out(db: Session, d: Document) -> DocumentOut:
+    pages = db.scalars(select(DocumentPage).where(DocumentPage.document_id == d.id)).all()
+    chunk_count = db.scalar(select(func.count()).select_from(Chunk).where(Chunk.document_id == d.id)) or 0
+    newer = db.scalar(select(Document.id).where(Document.supersedes_id == d.id))
+    warnings = [w for p in pages for w in (p.warnings or [])]
+    return DocumentOut(
+        id=d.id, title=d.title, category=d.category, department=d.department, source_date=d.source_date, language=d.language,
+        processing_status=d.processing_status, extraction_status=d.extraction_status, original_filename=d.original_filename,
+        mime_type=d.mime_type, page_count=len(pages), ocr_pages=sum(1 for p in pages if p.extraction_method == "ocr"),
+        chunk_count=chunk_count, warnings=warnings, error_message=d.error_message, supersedes_id=d.supersedes_id,
+        superseded_by_id=newer, created_at=d.created_at)
 
-class ExamCreateRequest(BaseModel):
-    exam_type: str
-    subject: str
-    section: str
-    exam_date: str
-    start_time: str
-    room: str
 
-class EventCreateRequest(BaseModel):
-    title: str
-    event_date: str
-    venue: str
-    description: Optional[str] = None
-    organizer: Optional[str] = None
+@router.get("/documents", response_model=list[DocumentOut], dependencies=protected)
+def list_documents(db: Session = Depends(get_db)) -> list[DocumentOut]:
+    docs = db.scalars(select(Document).order_by(Document.created_at.desc())).all()
+    return [_doc_out(db, d) for d in docs]
 
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm="HS256")
 
-def get_current_admin(authorization: Optional[str] = Header(None)) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid authentication token."
-        )
-    token = authorization.split(" ")[1]
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token payload.")
-        return username
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication token expired or invalid."
-        )
-
-# Authentication
-@router.post("/login", response_model=LoginResponse)
-def admin_login(creds: LoginRequest):
-    # Check username
-    if creds.username != settings.ADMIN_USERNAME:
-        raise HTTPException(status_code=401, detail="Invalid admin credentials.")
-    
-    # Check password (default: admin123)
-    if not verify_admin_password(creds.password):
-        raise HTTPException(status_code=401, detail="Invalid admin credentials.")
-
-    token = create_access_token({"sub": creds.username, "role": "admin"})
-    return LoginResponse(
-        access_token=token,
-        expires_in=settings.JWT_EXPIRE_MINUTES * 60
-    )
-
-# Document Management
-@router.get("/documents")
-def list_documents(
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    docs = db.query(Document).order_by(Document.created_at.desc()).all()
-    return [
-        {
-            "id": d.id,
-            "title": d.title,
-            "category": d.category,
-            "department": d.department,
-            "source_date": d.source_date,
-            "file_url": d.file_url,
-            "processing_status": d.processing_status,
-            "extraction_status": d.extraction_status,
-            "chunk_count": len(d.chunks),
-            "created_at": d.created_at.isoformat() if d.created_at else None
-        }
-        for d in docs
-    ]
-
-@router.post("/documents")
-async def upload_document(
+@router.post("/documents", response_model=UploadReport, status_code=201, dependencies=protected)
+def upload_document(
     file: UploadFile = File(...),
-    title: str = Form(...),
-    category: str = Form("Circular"),
-    department: str = Form("General"),
-    source_date: str = Form(...),
-    replaces_doc_id: Optional[str] = Form(None),
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
+    title: str = Form(..., min_length=1, max_length=300),
+    category: str = Form(..., min_length=1, max_length=100),
+    department: str = Form(..., min_length=1, max_length=100),
+    source_date: date = Form(...),
+    supersedes_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+    deps: IngestionDeps = Depends(get_ingestion_deps),
+    settings: Settings = Depends(get_settings),
+) -> UploadReport:
+    limit = settings.max_upload_bytes
+    data = file.file.read(limit + 1)  # never buffer more than the limit
     try:
-        report = ingest_document(
-            file_bytes=file_bytes,
-            filename=file.filename or "uploaded_doc.pdf",
-            content_type=file.content_type or "application/pdf",
-            title=title,
-            category=category,
-            department=department,
-            source_date=source_date,
-            db=db,
-            replaces_doc_id=replaces_doc_id
-        )
-        return report
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Document ingestion failed: {str(e)}")
+        report = ingest_document(db, deps, data=data, filename=file.filename or "upload", declared_mime=file.content_type,
+                                 title=title, category=category, department=department, source_date=source_date,
+                                 supersedes_id=supersedes_id or None, max_bytes=limit)
+    except UploadRejected as exc:
+        raise HTTPException(exc.status_code, exc.message)
+    doc = db.get(Document, report.document_id)
+    return UploadReport(document=_doc_out(db, doc), pages=report.pages, ocr_pages=report.ocr_pages, chunks=report.chunks,
+                        warnings=report.warnings, error=report.error, duration_ms=report.duration_ms)
 
-# Ticket Management
-@router.get("/tickets")
-def list_tickets(
-    department: Optional[str] = None,
-    status: Optional[str] = None,
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    query = db.query(Ticket)
+
+@router.patch("/documents/{doc_id}", response_model=DocumentOut, dependencies=protected)
+def patch_document(doc_id: str, body: DocumentPatch, db: Session = Depends(get_db), deps: IngestionDeps = Depends(get_ingestion_deps)) -> DocumentOut:
+    doc = db.get(Document, doc_id)
+    if doc is None:
+        raise HTTPException(404, "Document not found.")
+    changes = body.model_dump(exclude_unset=True)
+    if "supersedes_id" in changes and changes["supersedes_id"]:
+        target = changes["supersedes_id"]
+        if target == doc_id or db.get(Document, target) is None:
+            raise HTTPException(422, "Invalid document to supersede.")
+        cur = db.get(Document, target)
+        while cur is not None:  # refuse cycles
+            if cur.supersedes_id == doc_id:
+                raise HTTPException(422, "That would create a circular supersession chain.")
+            cur = db.get(Document, cur.supersedes_id) if cur.supersedes_id else None
+    for k, v in changes.items():
+        setattr(doc, k, v)
+    db.commit()
+    meta = {k: (v.isoformat() if isinstance(v, date) else v) for k, v in changes.items() if k in ("title", "category", "department", "source_date")}
+    if meta and doc.processing_status == DocumentStatus.processed.value:
+        deps.vectors.update_document_metadata(doc_id, meta)
+    return _doc_out(db, doc)
+
+
+# ------------------------------------------------------------------------------ tickets
+
+
+@router.get("/tickets", response_model=TicketList, dependencies=protected)
+def list_tickets(department: str | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=500),
+                 offset: int = Query(0, ge=0), db: Session = Depends(get_db)) -> TicketList:
+    if department and department not in DEPARTMENTS:
+        raise HTTPException(422, "Unknown department.")
+    if status and status not in [s.value for s in TicketStatus]:
+        raise HTTPException(422, "Unknown status.")
+    q = select(Ticket)
     if department:
-        query = query.filter(Ticket.department == department)
+        q = q.where(Ticket.department == department)
     if status:
-        query = query.filter(Ticket.status == status)
-    
-    tickets = query.order_by(Ticket.created_at.desc()).all()
-    return [
-        {
-            "id": t.id,
-            "question": t.question,
-            "department": t.department,
-            "status": t.status,
-            "contact": t.contact,
-            "user_id": t.user_id,
-            "user_name": t.user_name,
-            "user_email": t.user_email,
-            "user_phone": t.user_phone,
-            "resolution_note": t.resolution_note,
-            "created_at": t.created_at.isoformat() if t.created_at else None,
-            "resolved_at": t.resolved_at.isoformat() if t.resolved_at else None
-        }
-        for t in tickets
-    ]
+        q = q.where(Ticket.status == status)
+    total = db.scalar(select(func.count()).select_from(q.subquery())) or 0
+    rows = db.scalars(q.order_by(Ticket.created_at.desc()).limit(limit).offset(offset)).all()
+    return TicketList(total=total, items=[TicketOut.model_validate(r, from_attributes=True) for r in rows])
 
-@router.patch("/tickets/{ticket_id}")
-def update_ticket(
-    ticket_id: str,
-    update_data: TicketUpdateRequest,
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    if not ticket:
-        raise HTTPException(status_code=404, detail="Ticket not found.")
-    
-    if update_data.status:
-        ticket.status = update_data.status
-        if update_data.status == "resolved":
-            ticket.resolved_at = datetime.utcnow()
-    if update_data.resolution_note is not None:
-        ticket.resolution_note = update_data.resolution_note
 
+@router.patch("/tickets/{ticket_id}", response_model=TicketOut, dependencies=protected)
+def patch_ticket(ticket_id: str, body: TicketPatch, db: Session = Depends(get_db)) -> TicketOut:
+    t = db.get(Ticket, ticket_id)
+    if t is None:
+        raise HTTPException(404, "Ticket not found.")
+    if body.status is not None:
+        t.status = body.status
+        t.resolved_at = utcnow() if body.status == TicketStatus.resolved.value else None
+    if body.resolution_note is not None:
+        t.resolution_note = body.resolution_note.strip() or None
     db.commit()
-    return {"message": "Ticket updated successfully", "ticket_id": ticket.id, "status": ticket.status}
+    return TicketOut.model_validate(t, from_attributes=True)
 
-# Structured Data Entry by Admin
-@router.post("/faculty")
-def add_faculty(
-    req: FacultyCreateRequest,
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    f = Faculty(
-        name=req.name,
-        department=req.department,
-        designation=req.designation,
-        cabin=req.cabin,
-        block=req.block,
-        email=req.email,
-        phone=req.phone,
-        office_hours=req.office_hours
-    )
-    db.add(f)
-    db.commit()
-    db.refresh(f)
-    return {"message": "Faculty added successfully", "id": f.id, "name": f.name}
 
-@router.post("/timetable")
-def add_timetable(
-    req: TimetableCreateRequest,
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    tt = Timetable(
-        section=req.section,
-        day=req.day,
-        period=req.period,
-        start_time=req.start_time,
-        end_time=req.end_time,
-        subject=req.subject,
-        room=req.room,
-        faculty_id=req.faculty_id
-    )
-    db.add(tt)
-    db.commit()
-    db.refresh(tt)
-    return {"message": "Timetable period added successfully", "id": tt.id}
+# --------------------------------------------------------------------------- analytics
 
-@router.post("/exams")
-def add_exam(
-    req: ExamCreateRequest,
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    ex = Exam(
-        exam_type=req.exam_type,
-        subject=req.subject,
-        section=req.section,
-        exam_date=req.exam_date,
-        start_time=req.start_time,
-        room=req.room
-    )
-    db.add(ex)
-    db.commit()
-    db.refresh(ex)
-    return {"message": "Exam scheduled successfully", "id": ex.id}
+BUCKETS = [(0.0, 0.3), (0.3, 0.45), (0.45, 0.55), (0.55, 0.7), (0.7, 0.85), (0.85, 1.01)]
 
-@router.post("/events")
-def add_event(
-    req: EventCreateRequest,
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    ev = Event(
-        title=req.title,
-        event_date=req.event_date,
-        venue=req.venue,
-        description=req.description,
-        organizer=req.organizer
-    )
-    db.add(ev)
-    db.commit()
-    db.refresh(ev)
-    return {"message": "Campus event posted successfully", "id": ev.id}
 
-# Real Analytics
-@router.get("/analytics")
-def get_analytics(
-    admin: str = Depends(get_current_admin),
-    db: Session = Depends(get_db)
-):
-    total_docs = db.query(Document).count()
-    total_tickets = db.query(Ticket).count()
-    open_tickets = db.query(Ticket).filter(Ticket.status == "open").count()
-    resolved_tickets = db.query(Ticket).filter(Ticket.status == "resolved").count()
-    
-    total_messages = db.query(Message).count()
-    te_messages = db.query(Message).filter(Message.language == "te").count()
-    en_messages = total_messages - te_messages
+@router.get("/analytics", dependencies=protected)
+def analytics(db: Session = Depends(get_db)) -> dict:
+    user_msgs = func.lower(Message.text)
+    top = db.execute(select(user_msgs, func.count().label("n")).where(Message.role == MessageRole.user.value)
+                     .group_by(user_msgs).order_by(func.count().desc()).limit(10)).all()
+    languages = dict(db.execute(select(Message.language, func.count()).where(Message.role == MessageRole.user.value).group_by(Message.language)).all())
+    tickets_by_status = dict(db.execute(select(Ticket.status, func.count()).group_by(Ticket.status)).all())
+    tickets_by_dept = dict(db.execute(select(Ticket.department, func.count()).group_by(Ticket.department)).all())
+    unanswered = db.execute(select(Ticket.id, Ticket.question, Ticket.department, Ticket.status, Ticket.created_at)
+                            .order_by(Ticket.created_at.desc()).limit(10)).all()
 
-    avg_latency = db.query(func.avg(Message.latency_ms)).scalar() or 0.0
+    assistant = db.scalars(select(Message).where(Message.role == MessageRole.assistant.value)).all()
+    lat = [m.latency_ms for m in assistant if m.latency_ms is not None]
+    voice_parts = {k: [getattr(m, k) for m in assistant if getattr(m, k) is not None] for k in ("stt_ms", "llm_ms", "tts_ms")}
+    scores = [m.retrieval_metrics.get("top_score") for m in assistant if m.retrieval_metrics and m.retrieval_metrics.get("top_score") is not None]
+    dist = [{"range": f"{lo:.2f}-{min(hi, 1.0):.2f}", "count": sum(1 for s in scores if lo <= s < hi)} for lo, hi in BUCKETS]
+    decisions = Counter((m.retrieval_metrics or {}).get("decision") or "unknown" for m in assistant)
+    failures = db.scalars(select(Document).where(Document.processing_status == DocumentStatus.failed.value).order_by(Document.created_at.desc())).all()
+
+    def stats(xs: list[int]) -> dict:
+        return {"count": len(xs), "average_ms": round(statistics.mean(xs)) if xs else None, "median_ms": round(statistics.median(xs)) if xs else None}
 
     return {
-        "documents_count": total_docs,
-        "tickets_summary": {
-            "total": total_tickets,
-            "open": open_tickets,
-            "resolved": resolved_tickets
-        },
-        "conversations": {
-            "total_messages": total_messages,
-            "english_count": en_messages,
-            "telugu_count": te_messages,
-            "avg_latency_ms": round(float(avg_latency), 2)
-        }
+        "totals": {"questions": sum(languages.values()), "tickets": sum(tickets_by_status.values()),
+                   "documents": db.scalar(select(func.count()).select_from(Document)) or 0},
+        "top_questions": [{"question": q, "count": n} for q, n in top],
+        "unanswered_questions": [{"ticket_id": i, "question": q, "department": d, "status": s, "created_at": c.isoformat()} for i, q, d, s, c in unanswered],
+        "tickets_by_status": tickets_by_status, "tickets_by_department": tickets_by_dept,
+        "language_usage": {k or "unknown": v for k, v in languages.items()},
+        "latency": {"total": stats(lat), **{k.replace("_ms", ""): stats(v) for k, v in voice_parts.items()}},
+        "retrieval_confidence": {"buckets": dist, "decisions": dict(decisions)},
+        "document_failures": [{"id": d.id, "title": d.title, "error": d.error_message, "created_at": d.created_at.isoformat()} for d in failures],
     }
